@@ -3,11 +3,11 @@
   "collection": "@nestjs/schematics",
   "sourceRoot": "src",
   "compilerOptions": {
-    "deleteOutDir": true, // Elimina el directorio de salida (dist) antes de cada compilación
-    "webpack": false, // Indica si se usa Webpack para la compilación (false usa tsc por defecto)
-    "tsConfigPath": "tsconfig.build.json" // Ruta al archivo tsconfig para la compilación
+    "deleteOutDir": true, 
+    "webpack": false,
+    "tsConfigPath": "tsconfig.build.json"
   },
-  "monorepo": false, // Indica si el proyecto es parte de un monorepo
-  "root": "src", // Directorio raíz del código fuente (para la CLI)
-  "projects": {} // Configuración para proyectos en un monorepo (vacío si no es monorepo)
+  "monorepo": false,
+  "root": "src",
+  "projects": {}
 }
