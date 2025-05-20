@@ -2,46 +2,47 @@
 FROM node:18-alpine AS builder
 WORKDIR /usr/src/app
 
-# Set environment to production by default, can be overridden
-ENV NODE_ENV=production
+# No establezcas NODE_ENV=production aquí todavía,
+# para asegurar que npm ci instale las devDependencies necesarias para el build.
 
-# Copy package.json and package-lock.json (or yarn.lock)
+# Copia package.json y package-lock.json
 COPY package*.json ./
-# COPY yarn.lock ./ # Uncomment if you use Yarn
 
-# Install dependencies using npm ci for cleaner installs, or npm install
-# npm ci is generally recommended for CI/CD as it uses package-lock.json strictly
+# Instala TODAS las dependencias (incluyendo devDependencies) usando package-lock.json
+# Esto es necesario porque @nestjs/cli (usado en 'npm run build') es una devDependency.
 RUN npm ci
-# RUN yarn install --frozen-lockfile # Uncomment if you use Yarn
 
-# Copy the rest of the application source code
+# Copia el resto del código fuente de la aplicación
 COPY . .
 
-# Build the application
-# The "build" script should be defined in your package.json (e.g., "nest build")
-RUN npm run build
-# RUN yarn build # Uncomment if you use Yarn
+# Ahora puedes establecer NODE_ENV=production si tu proceso de build lo requiere específicamente,
+# aunque 'nest build' generalmente no depende de esto para su propia operación.
+# ENV NODE_ENV=production
 
-# Prune development dependencies (optional, but good practice if build doesn't do it)
-# RUN npm prune --production # Be cautious if your build step needs devDeps
+# Construye la aplicación
+# El script "build" (ej. "nest build") se define en tu package.json
+RUN npm run build
 
 # Stage 2: Create the production image
 FROM node:18-alpine
 WORKDIR /usr/src/app
 
-# Set environment to production
+# Establece el entorno a producción para la imagen final
 ENV NODE_ENV=production
 
-# Copy only necessary files from the builder stage
+# Copia solo los artefactos necesarios desde la etapa builder
+# 1. Las dependencias de producción (npm ci en la etapa builder ya las instaló,
+#    y si necesitas SOLO las de producción, podrías hacer un 'npm prune --production'
+#    en la etapa builder después del build, o instalar solo las de producción aquí).
+#    Por simplicidad y para asegurar que todo lo que necesita 'dist' esté, copiamos node_modules.
+#    Si el tamaño de la imagen es crítico, se puede optimizar copiando solo 'dist' y
+#    ejecutando 'npm ci --omit=dev' aquí después de copiar package*.json.
 COPY --from=builder /usr/src/app/node_modules ./node_modules
 COPY --from=builder /usr/src/app/package*.json ./
-# COPY --from=builder /usr/src/app/yarn.lock ./ # Uncomment if you use Yarn
 COPY --from=builder /usr/src/app/dist ./dist
 
-# Expose the port the app runs on (defined by PORT env var, default 3000)
-# This will be the port your NestJS app listens on (e.g., app.listen(process.env.PORT || 3000))
+# Expone el puerto en el que corre la aplicación
 EXPOSE ${PORT:-3000}
 
-# Command to run the application
-# This assumes your main entrypoint after build is 'dist/main.js'
+# Comando para correr la aplicación
 CMD ["node", "dist/main.js"]
