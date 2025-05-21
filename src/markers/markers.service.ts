@@ -1,5 +1,5 @@
 // src/markers/markers.service.ts
-import { Injectable, NotFoundException, InternalServerErrorException, Logger, BadRequestException, OnModuleInit } from '@nestjs/common';
+import { Injectable, NotFoundException, InternalServerErrorException, Logger, BadRequestException, OnModuleInit } from '@nestjs/common'; // Importar OnModuleInit
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Marker, MarkerProcessingStatus } from './entities/marker.entity';
@@ -31,7 +31,7 @@ type MindARCompilerModule = {
 };
 
 @Injectable()
-export class MarkersService implements OnModuleInit {
+export class MarkersService implements OnModuleInit { // Implementar OnModuleInit
   private readonly logger = new Logger(MarkersService.name);
   private mindArCompileFunction: MindARCompilerModule['compileImageTargets'] | null = null;
 
@@ -182,8 +182,10 @@ export class MarkersService implements OnModuleInit {
       
       const writer = fs.createWriteStream(tempImagePath);
       imageResponse.data.pipe(writer);
-      await new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
+
+      // CORRECCIÓN: Envolver resolve en una función que no tome argumentos
+      await new Promise<void>((resolve, reject) => {
+        writer.on('finish', () => resolve()); // <--- CORRECCIÓN AQUÍ
         writer.on('error', (err) => {
             this.logger.error(`Error writing downloaded image to temp file ${tempImagePath}: ${err.message}`);
             reject(err);
