@@ -1,5 +1,5 @@
 // src/markers/markers.service.ts
-import { Injectable, NotFoundException, InternalServerErrorException, Logger, BadRequestException, OnModuleInit } from '@nestjs/common'; // Importar OnModuleInit
+import { Injectable, NotFoundException, InternalServerErrorException, Logger, BadRequestException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Marker, MarkerProcessingStatus } from './entities/marker.entity';
@@ -11,47 +11,60 @@ import { User } from '../users/entities/user.entity';
 import axios, { AxiosResponse } from 'axios';
 import * as fs from 'fs-extra';
 import * as path from 'path';
-import { file as tmpFile, dir as tmpDir } from 'tmp-promise';
+import { file as tmpFilePromise, dir as tmpDirPromise } from 'tmp-promise'; // Renombrado para claridad
 
 // No importamos MindARCompiler estáticamente aquí
 
-// Definimos un tipo para la instancia del compilador, ya que la importación es dinámica
-type MindARCompilerInstance = {
-  compileFiles(files: any[]): Promise<any[] | ArrayBuffer[]>;
-  // Añade otros métodos si los usas directamente
+// Definimos un tipo para el módulo del compilador y su función
+type MindARCompilerModule = {
+  compileImageTargets: (
+    imagePaths: string[],
+    outputMindPath: string,
+    options?: {
+      maxTrackingTargets?: number;
+      weightScale?: number;
+      targetWidth?: number;
+      // Añade otras opciones si el compilador las soporta
+    }
+  ) => Promise<void>; // Asumimos que devuelve una promesa que se resuelve cuando termina
+  // Podría tener otros exports, pero compileImageTargets es el clave del ejemplo
 };
 
 @Injectable()
-export class MarkersService implements OnModuleInit { // Implementar OnModuleInit
+export class MarkersService implements OnModuleInit {
   private readonly logger = new Logger(MarkersService.name);
-  private mindArCompiler: MindARCompilerInstance | null = null; // Inicializar como null o undefined
+  private mindArCompileFunction: MindARCompilerModule['compileImageTargets'] | null = null;
 
   constructor(
     @InjectRepository(Marker)
     private markersRepository: Repository<Marker>,
     private storageService: StorageService,
-  ) {
-    // La instanciación se moverá a onModuleInit
-  }
+  ) {}
 
   async onModuleInit() {
     try {
       this.logger.log('Dynamically importing @maherboughdiri/mind-ar-compiler...');
-      const MindARCompilerModule = await import('@maherboughdiri/mind-ar-compiler');
-      // El paquete exporta la clase Compiler como default
-      const CompilerClass = MindARCompilerModule.default;
-      if (CompilerClass) {
-        this.mindArCompiler = new CompilerClass();
-        this.logger.log('@maherboughdiri/mind-ar-compiler loaded and instantiated successfully.');
+      // El ejemplo que encontraste usa: const { compileImageTargets } = require('@maherboughdiri/mind-ar-compiler');
+      // Esto sugiere que es un módulo CommonJS o que tiene una exportación nombrada.
+      // Intentaremos con importación dinámica primero.
+      const MindARCompilerModule = await import('@maherboughdiri/mind-ar-compiler') as MindARCompilerModule;
+
+      if (MindARCompilerModule && typeof MindARCompilerModule.compileImageTargets === 'function') {
+        this.mindArCompileFunction = MindARCompilerModule.compileImageTargets;
+        this.logger.log('@maherboughdiri/mind-ar-compiler.compileImageTargets loaded successfully.');
       } else {
-        this.logger.error('Failed to load default export from @maherboughdiri/mind-ar-compiler.');
-        throw new Error('Failed to load MindARCompiler default export.');
+        this.logger.error('Failed to load compileImageTargets function from @maherboughdiri/mind-ar-compiler.');
+        // Podrías intentar con require si la importación dinámica falla consistentemente para este paquete
+        // const cjsCompiler = require('@maherboughdiri/mind-ar-compiler');
+        // if (cjsCompiler && typeof cjsCompiler.compileImageTargets === 'function') {
+        //   this.mindArCompileFunction = cjsCompiler.compileImageTargets;
+        //   this.logger.log('@maherboughdiri/mind-ar-compiler.compileImageTargets loaded successfully using require().');
+        // } else {
+        //   throw new Error('Failed to load compileImageTargets function.');
+        // }
       }
     } catch (error) {
-      this.logger.error('Failed to dynamically import or instantiate @maherboughdiri/mind-ar-compiler', error.stack);
-      // Decide cómo manejar este error. Podrías lanzar una excepción para detener el inicio de la app
-      // o permitir que continúe pero con la funcionalidad de compilación deshabilitada.
-      // Por ahora, el servicio continuará pero mindArCompiler será null.
+      this.logger.error('Failed to dynamically import or load @maherboughdiri/mind-ar-compiler', error.stack);
     }
   }
 
@@ -94,43 +107,22 @@ export class MarkersService implements OnModuleInit { // Implementar OnModuleIni
     return savedMarker;
   }
 
-  private async compileMindARMarkerWithLibrary(imageBuffer: Buffer): Promise<Buffer> {
-    if (!this.mindArCompiler) {
-      this.logger.error('MindARCompiler not initialized. Cannot compile marker.');
-      throw new InternalServerErrorException('MindARCompiler not available.');
+  private async compileMarkerWithFilePaths(imagePath: string, outputMindFilePath: string): Promise<void> {
+    if (!this.mindArCompileFunction) {
+      this.logger.error('MindAR compileImageTargets function not initialized. Cannot compile marker.');
+      throw new InternalServerErrorException('MindARCompiler function not available.');
     }
-    this.logger.log(`Compiling image buffer with @maherboughdiri/mind-ar-compiler`);
+    this.logger.log(`Compiling image from path: ${imagePath} to ${outputMindFilePath} using @maherboughdiri/mind-ar-compiler`);
     try {
-      const pseudoFile = {
-        name: 'temp-marker-image.jpg', 
-        type: 'image/jpeg', 
-        arrayBuffer: () => Promise.resolve(imageBuffer.buffer.slice(imageBuffer.byteOffset, imageBuffer.byteOffset + imageBuffer.byteLength)),
+      // Opciones de compilación, puedes hacerlas configurables si es necesario
+      const compileOptions = {
+        // maxTrackingTargets: 1, // Ejemplo, ajusta según necesidad
+        // weightScale: 10,
+        // targetWidth: 1.0
       };
-
-      this.logger.log('Simulating File object for compiler. This might not work if the library expects a true browser File object.');
-      const compiledDataArray: any[] | ArrayBuffer[] = await this.mindArCompiler.compileFiles([pseudoFile as any]); 
-
-      if (!compiledDataArray || compiledDataArray.length === 0) {
-        throw new Error('MindAR Compiler (@maherboughdiri) did not return compiled data.');
-      }
       
-      const firstElement = compiledDataArray[0];
-      let compiledBuffer: Buffer;
-
-      if (firstElement instanceof ArrayBuffer) {
-        compiledBuffer = Buffer.from(firstElement);
-      } else if (Buffer.isBuffer(firstElement)) {
-        compiledBuffer = firstElement;
-      } else if (typeof firstElement === 'object' && firstElement !== null && (firstElement as any).type === 'Buffer' && Array.isArray((firstElement as any).data)) {
-        compiledBuffer = Buffer.from((firstElement as any).data);
-      }
-      else {
-        this.logger.warn(`Compiled data type is unexpected: ${typeof firstElement}. Attempting direct Buffer.from().`);
-        compiledBuffer = Buffer.from(firstElement as any); 
-      }
-
-      this.logger.log(`Image compiled successfully with @maherboughdiri/mind-ar-compiler. Output buffer size: ${compiledBuffer.length}`);
-      return compiledBuffer;
+      await this.mindArCompileFunction([imagePath], outputMindFilePath, compileOptions);
+      this.logger.log(`Image compiled successfully. Output .mind file should be at: ${outputMindFilePath}`);
 
     } catch (error) {
       this.logger.error(`Error compiling with @maherboughdiri/mind-ar-compiler: ${error.message}`, error.stack);
@@ -138,21 +130,19 @@ export class MarkersService implements OnModuleInit { // Implementar OnModuleIni
     }
   }
 
-
   async processMarker(markerId: string): Promise<void> {
-    if (!this.mindArCompiler) {
-      this.logger.error(`MindARCompiler not initialized for marker ID: ${markerId}. Skipping processing.`);
-      // Actualiza el estado del marcador a fallido si el compilador no está disponible
+    if (!this.mindArCompileFunction) {
+      this.logger.error(`MindAR compileImageTargets function not initialized for marker ID: ${markerId}. Skipping processing.`);
       const markerToFail = await this.markersRepository.findOneBy({ id: markerId });
       if (markerToFail) {
         markerToFail.status = MarkerProcessingStatus.FAILED;
-        markerToFail.processingError = 'MindARCompiler service not available.';
+        markerToFail.processingError = 'MindARCompiler function not available.';
         await this.markersRepository.save(markerToFail);
       }
       return;
     }
 
-    this.logger.log(`Starting REAL processing for marker ID: ${markerId} using @maherboughdiri/mind-ar-compiler`);
+    this.logger.log(`Starting REAL processing for marker ID: ${markerId} using @maherboughdiri/mind-ar-compiler (file path method)`);
     let marker = await this.markersRepository.findOneBy({ id: markerId });
 
     if (!marker || !marker.originalImageUrl) {
@@ -165,24 +155,60 @@ export class MarkersService implements OnModuleInit { // Implementar OnModuleIni
       return;
     }
 
-    const { path: tempDirPath, cleanup: cleanupTempDir } = await tmpDir({ unsafeCleanup: true });
+    const { path: tempDirPath, cleanup: cleanupTempDir } = await tmpDirPromise({ unsafeCleanup: true });
+    let tempImagePath: string | null = null;
+    let tempMindFilePath: string | null = null;
     
     try {
       marker.status = MarkerProcessingStatus.PROCESSING;
       marker.processingError = null;
       await this.markersRepository.save(marker);
 
-      this.logger.log(`Downloading image from Cloudinary: ${marker.originalImageUrl}`);
-      const imageResponse: AxiosResponse<ArrayBuffer> = await axios({
+      // 1. Descargar la imagen original de Cloudinary y guardarla en un archivo temporal
+      const imageExt = path.extname(new URL(marker.originalImageUrl).pathname) || '.jpg';
+      const { path: tempImageFilePathLocal, cleanup: cleanupTempImageFile } = await tmpFilePromise({
+        tmpdir: tempDirPath,
+        prefix: `markerimg_${markerId}_`,
+        postfix: imageExt,
+      });
+      tempImagePath = tempImageFilePathLocal;
+
+      this.logger.log(`Downloading image from Cloudinary: ${marker.originalImageUrl} to ${tempImagePath}`);
+      const imageResponse: AxiosResponse<NodeJS.ReadableStream> = await axios({
         method: 'get',
         url: marker.originalImageUrl,
-        responseType: 'arraybuffer',
+        responseType: 'stream',
       });
-      const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
-      this.logger.log(`Image downloaded successfully. Buffer size: ${imageBuffer.length}`);
+      
+      const writer = fs.createWriteStream(tempImagePath);
+      imageResponse.data.pipe(writer);
+      await new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', (err) => {
+            this.logger.error(`Error writing downloaded image to temp file ${tempImagePath}: ${err.message}`);
+            reject(err);
+        });
+      });
+      this.logger.log(`Image downloaded successfully to: ${tempImagePath}`);
 
-      const mindFileBuffer = await this.compileMindARMarkerWithLibrary(imageBuffer);
+      // 2. Preparar ruta para el archivo .mind de salida temporal
+      const { path: tempOutputMindPathLocal, cleanup: cleanupTempMindFile } = await tmpFilePromise({
+        tmpdir: tempDirPath,
+        prefix: `markermind_${markerId}_`,
+        postfix: '.mind',
+      });
+      tempMindFilePath = tempOutputMindPathLocal;
+      
+      // 3. Compilar la imagen usando la ruta del archivo temporal
+      await this.compileMarkerWithFilePaths(tempImagePath, tempMindFilePath);
 
+      // 4. Verificar si el archivo .mind se generó
+      if (!await fs.pathExists(tempMindFilePath) || (await fs.stat(tempMindFilePath)).size === 0) {
+          throw new Error('MindAR compiled file (.mind) was not generated by the compiler or is empty.');
+      }
+
+      // 5. Leer el buffer del archivo .mind y subirlo a Cloudinary
+      const mindFileBuffer = await fs.readFile(tempMindFilePath);
       const mindFileForUpload: Express.Multer.File = {
         fieldname: 'file',
         originalname: `${marker.id}.mind`,
@@ -200,27 +226,32 @@ export class MarkersService implements OnModuleInit { // Implementar OnModuleIni
       );
       this.logger.log(`Processed MindAR marker uploaded to Cloudinary: ${uploadedProcessedMarkerInfo.public_id}`);
 
+      // 6. Actualiza la entidad Marker
       marker.processedMarkerCloudinaryPublicId = uploadedProcessedMarkerInfo.public_id;
       marker.processedMarkerUrl = uploadedProcessedMarkerInfo.secure_url;
       marker.status = MarkerProcessingStatus.PROCESSED;
-      marker.recommendations = "Marcador procesado con @maherboughdiri/mind-ar-compiler.";
+      marker.recommendations = "Marcador procesado con @maherboughdiri/mind-ar-compiler (file path).";
 
       await this.markersRepository.save(marker);
-      this.logger.log(`Successfully processed marker ID: ${markerId} with @maherboughdiri/mind-ar-compiler.`);
+      this.logger.log(`Successfully processed marker ID: ${markerId} with @maherboughdiri/mind-ar-compiler (file path).`);
 
     } catch (error) {
       this.logger.error(`Failed to process marker ID ${markerId} with @maherboughdiri/mind-ar-compiler: ${error.message}`, error.stack);
-      marker = await this.markersRepository.findOneBy({ id: markerId });
+      marker = await this.markersRepository.findOneBy({ id: markerId }); // Re-fetch
       if(marker){
           marker.status = MarkerProcessingStatus.FAILED;
           marker.processingError = error.message.substring(0, 250);
           await this.markersRepository.save(marker);
       }
     } finally {
+      // 7. Limpieza de archivos temporales
+      if (tempImagePath) await fs.remove(tempImagePath).catch(e => this.logger.error(`Error cleaning up temp image file: ${e.message}`));
+      if (tempMindFilePath) await fs.remove(tempMindFilePath).catch(e => this.logger.error(`Error cleaning up temp .mind file: ${e.message}`));
       await cleanupTempDir().catch(e => this.logger.error(`Error cleaning up temp directory: ${e.message}`));
     }
   }
 
+  // ... findAll, findOne, update, remove (sin cambios) ...
   async findAll(user: User): Promise<Marker[]> {
     if (user.role === 'superadmin') {
         return this.markersRepository.find();
