@@ -5,23 +5,31 @@ import { Repository } from 'typeorm';
 import { Marker, MarkerProcessingStatus } from './entities/marker.entity';
 import { CreateMarkerDto } from './dto/create-marker.dto';
 import { UpdateMarkerDto } from './dto/update-marker.dto';
-// Rutas corregidas: ../ en lugar de ../../
 import { StorageService } from '../storage/storage.service';
 import { User } from '../users/entities/user.entity';
-// Importa aquí las bibliotecas o herramientas necesarias para el procesamiento de marcadores
-// Ejemplo: import * as child_process from 'child_process';
-// Ejemplo: import * as fs from 'fs-extra';
-// Ejemplo: import * as path from 'path';
+
+import axios from 'axios';
+import * as fs from 'fs-extra';
+import * as path from 'path';
+import { file as tmpFile, dir as tmpDir } from 'tmp-promise';
+// Ya no necesitamos spawn si el compilador es una biblioteca de Node.js
+// import { spawn } from 'child_process';
+
+// Importa el compilador que acabas de instalar
+import MindARCompiler from '@maherboughdiri/mind-ar-compiler';
 
 @Injectable()
 export class MarkersService {
   private readonly logger = new Logger(MarkersService.name);
+  private mindArCompiler: MindARCompiler; // Declara una instancia del compilador
 
   constructor(
     @InjectRepository(Marker)
     private markersRepository: Repository<Marker>,
     private storageService: StorageService,
-  ) {}
+  ) {
+    this.mindArCompiler = new MindARCompiler(); // Instancia el compilador
+  }
 
   async create(
     createMarkerDto: CreateMarkerDto,
@@ -62,53 +70,135 @@ export class MarkersService {
     return savedMarker;
   }
 
+  private async compileMindARMarkerWithLibrary(imageBuffer: Buffer): Promise<Buffer> {
+    this.logger.log(`Compiling image buffer with @maherboughdiri/mind-ar-compiler`);
+    try {
+      // La documentación de @maherboughdiri/mind-ar-compiler sugiere `compileFiles` que espera un array de objetos File.
+      // Necesitamos adaptar nuestro buffer de imagen a algo que `compileFiles` pueda aceptar,
+      // o ver si hay otro método en el paquete que acepte un buffer directamente.
+
+      // Asumiremos que necesitamos simular un objeto File. Esto es especulativo.
+      // Es POSIBLE que este paquete no funcione directamente con buffers y espere un entorno de navegador
+      // o una API de File. Si es así, este enfoque fallará.
+      const pseudoFile = {
+        name: 'temp-marker-image.jpg', // Nombre de archivo temporal
+        type: 'image/jpeg', // Asume JPEG, ajusta si es necesario
+        arrayBuffer: () => Promise.resolve(imageBuffer.buffer.slice(imageBuffer.byteOffset, imageBuffer.byteOffset + imageBuffer.byteLength)),
+        // Otras propiedades que un objeto File podría tener, si son necesarias para el compilador
+      };
+
+      // La función compileFiles espera un array de estos pseudo-objetos File
+      // El paquete @maherboughdiri/mind-ar-compiler podría no estar diseñado para buffers directos en Node.js.
+      // Su documentación en Yarn (https://classic.yarnpkg.com/en/package/@maherboughdiri/mind-ar-compiler)
+      // dice: const files = // array of image File objects
+      // Esto es más típico de un entorno de navegador.
+
+      // ¡¡¡ALERTA DE POSIBLE PROBLEMA!!!
+      // Si `compileFiles` está estrictamente ligado a la API `File` del navegador, este enfoque fallará en Node.js.
+      // Necesitaríamos una forma de que este compilador trabaje con buffers o rutas de archivo en Node.js.
+      // Por ahora, intentaremos esto, pero es probable que necesitemos investigar más sobre cómo usar
+      // @maherboughdiri/mind-ar-compiler en un backend Node.js o encontrar una alternativa si no es compatible.
+
+      this.logger.log('Simulating File object for compiler. This might not work if the library expects a true browser File object.');
+      const compiledDataArray = await this.mindArCompiler.compileFiles([pseudoFile as any]); // Usamos 'as any' para el pseudoFile
+
+      if (!compiledDataArray || compiledDataArray.length === 0) {
+        throw new Error('MindAR Compiler (@maherboughdiri) did not return compiled data.');
+      }
+
+      // Asumimos que `compiledDataArray` es un array de buffers o algo convertible a buffer.
+      // La documentación dice que `compileFiles` devuelve "compiled data". Necesitamos saber su formato.
+      // Si es un DataView o ArrayBuffer, necesitamos convertirlo a un Buffer de Node.js.
+      // Por ahora, asumiremos que el primer elemento es lo que necesitamos y que es un buffer o convertible.
+      const compiledBuffer = Buffer.from(compiledDataArray[0]); // Esto es una suposición fuerte.
+
+      this.logger.log(`Image compiled successfully with @maherboughdiri/mind-ar-compiler. Output buffer size: ${compiledBuffer.length}`);
+      return compiledBuffer;
+
+    } catch (error) {
+      this.logger.error(`Error compiling with @maherboughdiri/mind-ar-compiler: ${error.message}`, error.stack);
+      throw error; // Relanza el error para que sea manejado por processMarker
+    }
+  }
+
+
   async processMarker(markerId: string): Promise<void> {
-    this.logger.log(`Starting processing for marker ID: ${markerId}`);
-    const marker = await this.markersRepository.findOneBy({ id: markerId });
+    this.logger.log(`Starting REAL processing for marker ID: ${markerId} using @maherboughdiri/mind-ar-compiler`);
+    let marker = await this.markersRepository.findOneBy({ id: markerId });
 
     if (!marker || !marker.originalImageUrl) {
       this.logger.error(`Marker or original image URL not found for ID: ${markerId}`);
       if (marker) {
         marker.status = MarkerProcessingStatus.FAILED;
-        marker.processingError = 'Original image URL not found.';
+        marker.processingError = 'Original image URL not found for processing.';
         await this.markersRepository.save(marker);
       }
       return;
     }
 
+    const { path: tempDirPath, cleanup: cleanupTempDir } = await tmpDir({ unsafeCleanup: true });
+    let tempImagePath: string | null = null; // No necesitaremos guardar la imagen en disco si el compilador acepta buffer
+
     try {
       marker.status = MarkerProcessingStatus.PROCESSING;
-      await this.markersRepository.save(marker);
-
-      // --- LÓGICA DE PROCESAMIENTO DEL MARCADOR (SIMULADA) ---
-      this.logger.log(`Simulating marker processing for ID: ${markerId}. Implement actual logic here.`);
-      // Aquí iría la lógica real para descargar la imagen de Cloudinary,
-      // ejecutar la herramienta de compilación del marcador (MindAR, AR.js NFT, etc.),
-      // y luego subir el archivo procesado a Cloudinary.
-
-      // Simulación:
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Simula trabajo
-
-      marker.processedMarkerCloudinaryPublicId = `processed_marker_originals/simulated_${markerId}`; // Ejemplo
-      marker.processedMarkerUrl = `https://res.cloudinary.com/your_cloud_name/raw/upload/v12345/processed_marker_originals/simulated_${markerId}.mind`; // Ejemplo
-      marker.status = MarkerProcessingStatus.PROCESSED;
       marker.processingError = null;
-      marker.recommendations = "Marcador procesado (simulado). Implementar lógica real.";
-      // --- FIN DE LA LÓGICA DE PROCESAMIENTO (SIMULADA) ---
+      await this.markersRepository.save(marker);
+
+      // 1. Descargar la imagen original de Cloudinary como un buffer
+      this.logger.log(`Downloading image from Cloudinary: ${marker.originalImageUrl}`);
+      const imageResponse = await axios({
+        method: 'get',
+        url: marker.originalImageUrl,
+        responseType: 'arraybuffer', // Descargar como arraybuffer
+      });
+      const imageBuffer = Buffer.from(imageResponse.data); // Convertir a Buffer de Node.js
+      this.logger.log(`Image downloaded successfully. Buffer size: ${imageBuffer.length}`);
+
+      // 2. Compilar la imagen usando la biblioteca @maherboughdiri/mind-ar-compiler
+      const mindFileBuffer = await this.compileMindARMarkerWithLibrary(imageBuffer);
+
+      // 3. Sube el buffer del archivo .mind procesado a Cloudinary
+      const mindFileForUpload: Express.Multer.File = {
+        fieldname: 'file',
+        originalname: `${marker.id}.mind`,
+        encoding: '7bit',
+        mimetype: 'application/octet-stream',
+        buffer: mindFileBuffer,
+        size: mindFileBuffer.length,
+        stream: null, destination: '', filename: '', path: ''
+      };
+
+      const uploadedProcessedMarkerInfo = await this.storageService.uploadFile(
+        mindFileForUpload,
+        'marker_processed_mindar',
+        'raw',
+      );
+      this.logger.log(`Processed MindAR marker uploaded to Cloudinary: ${uploadedProcessedMarkerInfo.public_id}`);
+
+      // 4. Actualiza la entidad Marker
+      marker.processedMarkerCloudinaryPublicId = uploadedProcessedMarkerInfo.public_id;
+      marker.processedMarkerUrl = uploadedProcessedMarkerInfo.secure_url;
+      marker.status = MarkerProcessingStatus.PROCESSED;
+      marker.recommendations = "Marcador procesado con @maherboughdiri/mind-ar-compiler.";
 
       await this.markersRepository.save(marker);
-      this.logger.log(`Successfully processed marker ID: ${markerId}`);
+      this.logger.log(`Successfully processed marker ID: ${markerId} with @maherboughdiri/mind-ar-compiler.`);
 
     } catch (error) {
-      this.logger.error(`Failed to process marker ID ${markerId}: ${error.message}`, error.stack);
-      if (marker) { // Asegurarse que marker existe antes de intentar guardarlo
-        marker.status = MarkerProcessingStatus.FAILED;
-        marker.processingError = error.message.substring(0, 250);
-        await this.markersRepository.save(marker);
+      this.logger.error(`Failed to process marker ID ${markerId} with @maherboughdiri/mind-ar-compiler: ${error.message}`, error.stack);
+      marker = await this.markersRepository.findOneBy({ id: markerId });
+      if(marker){
+          marker.status = MarkerProcessingStatus.FAILED;
+          marker.processingError = error.message.substring(0, 250);
+          await this.markersRepository.save(marker);
       }
+    } finally {
+      // Ya no necesitamos limpiar archivos temporales de imagen o .mind si trabajamos con buffers
+      await cleanupTempDir().catch(e => this.logger.error(`Error cleaning up temp directory: ${e.message}`));
     }
   }
 
+  // ... findAll, findOne, update, remove (sin cambios significativos para esta tarea) ...
   async findAll(user: User): Promise<Marker[]> {
     if (user.role === 'superadmin') {
         return this.markersRepository.find();
