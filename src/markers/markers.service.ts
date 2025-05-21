@@ -1,5 +1,5 @@
 // src/markers/markers.service.ts
-import { Injectable, NotFoundException, InternalServerErrorException, Logger, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, InternalServerErrorException, Logger, BadRequestException, OnModuleInit } from '@nestjs/common'; // Importar OnModuleInit
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Marker, MarkerProcessingStatus } from './entities/marker.entity';
@@ -8,27 +8,51 @@ import { UpdateMarkerDto } from './dto/update-marker.dto';
 import { StorageService } from '../storage/storage.service';
 import { User } from '../users/entities/user.entity';
 
-import axios, { AxiosResponse } from 'axios'; // Importar AxiosResponse para tipado
+import axios, { AxiosResponse } from 'axios';
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import { file as tmpFile, dir as tmpDir } from 'tmp-promise';
-// Ya no necesitamos spawn si el compilador es una biblioteca de Node.js
-// import { spawn } from 'child_process';
 
-// Importa el compilador que acabas de instalar
-import MindARCompiler from '@maherboughdiri/mind-ar-compiler';
+// No importamos MindARCompiler estáticamente aquí
+
+// Definimos un tipo para la instancia del compilador, ya que la importación es dinámica
+type MindARCompilerInstance = {
+  compileFiles(files: any[]): Promise<any[] | ArrayBuffer[]>;
+  // Añade otros métodos si los usas directamente
+};
 
 @Injectable()
-export class MarkersService {
+export class MarkersService implements OnModuleInit { // Implementar OnModuleInit
   private readonly logger = new Logger(MarkersService.name);
-  private mindArCompiler: MindARCompiler; // Declara una instancia del compilador
+  private mindArCompiler: MindARCompilerInstance | null = null; // Inicializar como null o undefined
 
   constructor(
     @InjectRepository(Marker)
     private markersRepository: Repository<Marker>,
     private storageService: StorageService,
   ) {
-    this.mindArCompiler = new MindARCompiler(); // Instancia el compilador
+    // La instanciación se moverá a onModuleInit
+  }
+
+  async onModuleInit() {
+    try {
+      this.logger.log('Dynamically importing @maherboughdiri/mind-ar-compiler...');
+      const MindARCompilerModule = await import('@maherboughdiri/mind-ar-compiler');
+      // El paquete exporta la clase Compiler como default
+      const CompilerClass = MindARCompilerModule.default;
+      if (CompilerClass) {
+        this.mindArCompiler = new CompilerClass();
+        this.logger.log('@maherboughdiri/mind-ar-compiler loaded and instantiated successfully.');
+      } else {
+        this.logger.error('Failed to load default export from @maherboughdiri/mind-ar-compiler.');
+        throw new Error('Failed to load MindARCompiler default export.');
+      }
+    } catch (error) {
+      this.logger.error('Failed to dynamically import or instantiate @maherboughdiri/mind-ar-compiler', error.stack);
+      // Decide cómo manejar este error. Podrías lanzar una excepción para detener el inicio de la app
+      // o permitir que continúe pero con la funcionalidad de compilación deshabilitada.
+      // Por ahora, el servicio continuará pero mindArCompiler será null.
+    }
   }
 
   async create(
@@ -71,6 +95,10 @@ export class MarkersService {
   }
 
   private async compileMindARMarkerWithLibrary(imageBuffer: Buffer): Promise<Buffer> {
+    if (!this.mindArCompiler) {
+      this.logger.error('MindARCompiler not initialized. Cannot compile marker.');
+      throw new InternalServerErrorException('MindARCompiler not available.');
+    }
     this.logger.log(`Compiling image buffer with @maherboughdiri/mind-ar-compiler`);
     try {
       const pseudoFile = {
@@ -80,16 +108,12 @@ export class MarkersService {
       };
 
       this.logger.log('Simulating File object for compiler. This might not work if the library expects a true browser File object.');
-      // El tipo de retorno de compileFiles es `Promise<any[] | ArrayBuffer[]>` según su d.ts,
-      // así que necesitamos manejarlo apropiadamente.
       const compiledDataArray: any[] | ArrayBuffer[] = await this.mindArCompiler.compileFiles([pseudoFile as any]); 
 
       if (!compiledDataArray || compiledDataArray.length === 0) {
         throw new Error('MindAR Compiler (@maherboughdiri) did not return compiled data.');
       }
       
-      // Asumimos que el primer elemento es un ArrayBuffer o algo que Buffer.from puede manejar.
-      // Si es un ArrayBuffer, Buffer.from(arrayBuffer) es correcto.
       const firstElement = compiledDataArray[0];
       let compiledBuffer: Buffer;
 
@@ -97,16 +121,13 @@ export class MarkersService {
         compiledBuffer = Buffer.from(firstElement);
       } else if (Buffer.isBuffer(firstElement)) {
         compiledBuffer = firstElement;
-      } else if (typeof firstElement === 'object' && firstElement !== null && firstElement.type === 'Buffer' && Array.isArray(firstElement.data)) {
-        // Manejar el caso donde podría ser un objeto Buffer serializado
-        compiledBuffer = Buffer.from(firstElement.data);
+      } else if (typeof firstElement === 'object' && firstElement !== null && (firstElement as any).type === 'Buffer' && Array.isArray((firstElement as any).data)) {
+        compiledBuffer = Buffer.from((firstElement as any).data);
       }
       else {
-        // Intenta convertirlo directamente, esto podría fallar si el tipo no es compatible
         this.logger.warn(`Compiled data type is unexpected: ${typeof firstElement}. Attempting direct Buffer.from().`);
         compiledBuffer = Buffer.from(firstElement as any); 
       }
-
 
       this.logger.log(`Image compiled successfully with @maherboughdiri/mind-ar-compiler. Output buffer size: ${compiledBuffer.length}`);
       return compiledBuffer;
@@ -119,6 +140,18 @@ export class MarkersService {
 
 
   async processMarker(markerId: string): Promise<void> {
+    if (!this.mindArCompiler) {
+      this.logger.error(`MindARCompiler not initialized for marker ID: ${markerId}. Skipping processing.`);
+      // Actualiza el estado del marcador a fallido si el compilador no está disponible
+      const markerToFail = await this.markersRepository.findOneBy({ id: markerId });
+      if (markerToFail) {
+        markerToFail.status = MarkerProcessingStatus.FAILED;
+        markerToFail.processingError = 'MindARCompiler service not available.';
+        await this.markersRepository.save(markerToFail);
+      }
+      return;
+    }
+
     this.logger.log(`Starting REAL processing for marker ID: ${markerId} using @maherboughdiri/mind-ar-compiler`);
     let marker = await this.markersRepository.findOneBy({ id: markerId });
 
@@ -140,12 +173,11 @@ export class MarkersService {
       await this.markersRepository.save(marker);
 
       this.logger.log(`Downloading image from Cloudinary: ${marker.originalImageUrl}`);
-      const imageResponse: AxiosResponse<ArrayBuffer> = await axios({ // Tipar la respuesta de Axios
+      const imageResponse: AxiosResponse<ArrayBuffer> = await axios({
         method: 'get',
         url: marker.originalImageUrl,
         responseType: 'arraybuffer',
       });
-      // CORRECCIÓN: Asegurar que imageResponse.data es tratado como ArrayBuffer
       const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
       this.logger.log(`Image downloaded successfully. Buffer size: ${imageBuffer.length}`);
 
