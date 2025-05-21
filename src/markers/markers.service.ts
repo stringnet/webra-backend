@@ -8,7 +8,7 @@ import { UpdateMarkerDto } from './dto/update-marker.dto';
 import { StorageService } from '../storage/storage.service';
 import { User } from '../users/entities/user.entity';
 
-import axios from 'axios';
+import axios, { AxiosResponse } from 'axios'; // Importar AxiosResponse para tipado
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import { file as tmpFile, dir as tmpDir } from 'tmp-promise';
@@ -73,51 +73,47 @@ export class MarkersService {
   private async compileMindARMarkerWithLibrary(imageBuffer: Buffer): Promise<Buffer> {
     this.logger.log(`Compiling image buffer with @maherboughdiri/mind-ar-compiler`);
     try {
-      // La documentación de @maherboughdiri/mind-ar-compiler sugiere `compileFiles` que espera un array de objetos File.
-      // Necesitamos adaptar nuestro buffer de imagen a algo que `compileFiles` pueda aceptar,
-      // o ver si hay otro método en el paquete que acepte un buffer directamente.
-
-      // Asumiremos que necesitamos simular un objeto File. Esto es especulativo.
-      // Es POSIBLE que este paquete no funcione directamente con buffers y espere un entorno de navegador
-      // o una API de File. Si es así, este enfoque fallará.
       const pseudoFile = {
-        name: 'temp-marker-image.jpg', // Nombre de archivo temporal
-        type: 'image/jpeg', // Asume JPEG, ajusta si es necesario
+        name: 'temp-marker-image.jpg', 
+        type: 'image/jpeg', 
         arrayBuffer: () => Promise.resolve(imageBuffer.buffer.slice(imageBuffer.byteOffset, imageBuffer.byteOffset + imageBuffer.byteLength)),
-        // Otras propiedades que un objeto File podría tener, si son necesarias para el compilador
       };
 
-      // La función compileFiles espera un array de estos pseudo-objetos File
-      // El paquete @maherboughdiri/mind-ar-compiler podría no estar diseñado para buffers directos en Node.js.
-      // Su documentación en Yarn (https://classic.yarnpkg.com/en/package/@maherboughdiri/mind-ar-compiler)
-      // dice: const files = // array of image File objects
-      // Esto es más típico de un entorno de navegador.
-
-      // ¡¡¡ALERTA DE POSIBLE PROBLEMA!!!
-      // Si `compileFiles` está estrictamente ligado a la API `File` del navegador, este enfoque fallará en Node.js.
-      // Necesitaríamos una forma de que este compilador trabaje con buffers o rutas de archivo en Node.js.
-      // Por ahora, intentaremos esto, pero es probable que necesitemos investigar más sobre cómo usar
-      // @maherboughdiri/mind-ar-compiler en un backend Node.js o encontrar una alternativa si no es compatible.
-
       this.logger.log('Simulating File object for compiler. This might not work if the library expects a true browser File object.');
-      const compiledDataArray = await this.mindArCompiler.compileFiles([pseudoFile as any]); // Usamos 'as any' para el pseudoFile
+      // El tipo de retorno de compileFiles es `Promise<any[] | ArrayBuffer[]>` según su d.ts,
+      // así que necesitamos manejarlo apropiadamente.
+      const compiledDataArray: any[] | ArrayBuffer[] = await this.mindArCompiler.compileFiles([pseudoFile as any]); 
 
       if (!compiledDataArray || compiledDataArray.length === 0) {
         throw new Error('MindAR Compiler (@maherboughdiri) did not return compiled data.');
       }
+      
+      // Asumimos que el primer elemento es un ArrayBuffer o algo que Buffer.from puede manejar.
+      // Si es un ArrayBuffer, Buffer.from(arrayBuffer) es correcto.
+      const firstElement = compiledDataArray[0];
+      let compiledBuffer: Buffer;
 
-      // Asumimos que `compiledDataArray` es un array de buffers o algo convertible a buffer.
-      // La documentación dice que `compileFiles` devuelve "compiled data". Necesitamos saber su formato.
-      // Si es un DataView o ArrayBuffer, necesitamos convertirlo a un Buffer de Node.js.
-      // Por ahora, asumiremos que el primer elemento es lo que necesitamos y que es un buffer o convertible.
-      const compiledBuffer = Buffer.from(compiledDataArray[0]); // Esto es una suposición fuerte.
+      if (firstElement instanceof ArrayBuffer) {
+        compiledBuffer = Buffer.from(firstElement);
+      } else if (Buffer.isBuffer(firstElement)) {
+        compiledBuffer = firstElement;
+      } else if (typeof firstElement === 'object' && firstElement !== null && firstElement.type === 'Buffer' && Array.isArray(firstElement.data)) {
+        // Manejar el caso donde podría ser un objeto Buffer serializado
+        compiledBuffer = Buffer.from(firstElement.data);
+      }
+      else {
+        // Intenta convertirlo directamente, esto podría fallar si el tipo no es compatible
+        this.logger.warn(`Compiled data type is unexpected: ${typeof firstElement}. Attempting direct Buffer.from().`);
+        compiledBuffer = Buffer.from(firstElement as any); 
+      }
+
 
       this.logger.log(`Image compiled successfully with @maherboughdiri/mind-ar-compiler. Output buffer size: ${compiledBuffer.length}`);
       return compiledBuffer;
 
     } catch (error) {
       this.logger.error(`Error compiling with @maherboughdiri/mind-ar-compiler: ${error.message}`, error.stack);
-      throw error; // Relanza el error para que sea manejado por processMarker
+      throw error;
     }
   }
 
@@ -137,27 +133,24 @@ export class MarkersService {
     }
 
     const { path: tempDirPath, cleanup: cleanupTempDir } = await tmpDir({ unsafeCleanup: true });
-    let tempImagePath: string | null = null; // No necesitaremos guardar la imagen en disco si el compilador acepta buffer
-
+    
     try {
       marker.status = MarkerProcessingStatus.PROCESSING;
       marker.processingError = null;
       await this.markersRepository.save(marker);
 
-      // 1. Descargar la imagen original de Cloudinary como un buffer
       this.logger.log(`Downloading image from Cloudinary: ${marker.originalImageUrl}`);
-      const imageResponse = await axios({
+      const imageResponse: AxiosResponse<ArrayBuffer> = await axios({ // Tipar la respuesta de Axios
         method: 'get',
         url: marker.originalImageUrl,
-        responseType: 'arraybuffer', // Descargar como arraybuffer
+        responseType: 'arraybuffer',
       });
-      const imageBuffer = Buffer.from(imageResponse.data); // Convertir a Buffer de Node.js
+      // CORRECCIÓN: Asegurar que imageResponse.data es tratado como ArrayBuffer
+      const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
       this.logger.log(`Image downloaded successfully. Buffer size: ${imageBuffer.length}`);
 
-      // 2. Compilar la imagen usando la biblioteca @maherboughdiri/mind-ar-compiler
       const mindFileBuffer = await this.compileMindARMarkerWithLibrary(imageBuffer);
 
-      // 3. Sube el buffer del archivo .mind procesado a Cloudinary
       const mindFileForUpload: Express.Multer.File = {
         fieldname: 'file',
         originalname: `${marker.id}.mind`,
@@ -175,7 +168,6 @@ export class MarkersService {
       );
       this.logger.log(`Processed MindAR marker uploaded to Cloudinary: ${uploadedProcessedMarkerInfo.public_id}`);
 
-      // 4. Actualiza la entidad Marker
       marker.processedMarkerCloudinaryPublicId = uploadedProcessedMarkerInfo.public_id;
       marker.processedMarkerUrl = uploadedProcessedMarkerInfo.secure_url;
       marker.status = MarkerProcessingStatus.PROCESSED;
@@ -193,12 +185,10 @@ export class MarkersService {
           await this.markersRepository.save(marker);
       }
     } finally {
-      // Ya no necesitamos limpiar archivos temporales de imagen o .mind si trabajamos con buffers
       await cleanupTempDir().catch(e => this.logger.error(`Error cleaning up temp directory: ${e.message}`));
     }
   }
 
-  // ... findAll, findOne, update, remove (sin cambios significativos para esta tarea) ...
   async findAll(user: User): Promise<Marker[]> {
     if (user.role === 'superadmin') {
         return this.markersRepository.find();
